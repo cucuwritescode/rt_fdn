@@ -19,6 +19,7 @@ from flamo_rt.codegen.flamo_to_json import (
     flamo_to_json,
     _classify_gain,
     _detect_module_type,
+    _fractional_delays,
     _normalise_sos,
     _quantise_delays,
 )
@@ -154,6 +155,43 @@ class TestQuantiseDelays:
         delays_sec = np.array([1.5 / 48000.0, 2.5 / 48000.0])
         samples = _quantise_delays(delays_sec, 48000.0)
         assert samples == [2, 2]  #numpy rounds 0.5 to even
+
+
+#fractional delay extraction tests
+
+class TestFractionalDelays:
+    def test_basic_conversion(self):
+        delays_sec = np.array([0.023, 0.030])
+        samples = _fractional_delays(delays_sec, 48000.0)
+        assert samples == pytest.approx([1104.0, 1440.0])
+
+    def test_preserves_fractional_part(self):
+        #50.7 samples should round-trip without loss
+        delays_sec = np.array([50.7 / 48000.0])
+        samples = _fractional_delays(delays_sec, 48000.0)
+        assert samples == pytest.approx([50.7])
+
+    def test_returns_floats(self):
+        delays_sec = np.array([0.020833333])
+        samples = _fractional_delays(delays_sec, 48000.0)
+        assert all(isinstance(s, float) for s in samples)
+
+    def test_emitted_alongside_integer_samples(self):
+        #flamo_to_json should include both fields for parallelDelay
+        from flamo_rt.codegen.flamo_to_json import _serialise_leaf
+
+        delay = parallelDelay(np.array([0.023, 0.030]), fs=48000.0)
+        node = _serialise_leaf(delay, "d", fs=48000.0)
+        assert "samples" in node["params"]
+        assert "samples_fractional" in node["params"]
+        assert all(isinstance(s, int) for s in node["params"]["samples"])
+        assert all(isinstance(s, float) for s in node["params"]["samples_fractional"])
+        #integer rounding matches np.round
+        assert node["params"]["samples"] == [1104, 1440]
+        #fractional values are the raw seconds*fs without rounding
+        assert node["params"]["samples_fractional"] == pytest.approx(
+            [0.023 * 48000.0, 0.030 * 48000.0]
+        )
 
 
 #sos normalisation tests

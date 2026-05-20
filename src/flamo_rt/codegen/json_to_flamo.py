@@ -122,9 +122,15 @@ def _build_leaf(
 
 
 def _build_delay(node, params, meta, fs, nfft, adb, rg, device):
-    """construct a parallelDelay module."""
+    """construct a parallelDelay module.
+
+    when the original module was constructed with isint=False the
+    fractional delay vector is preferred over the rounded integer
+    samples so that the round trip is exact.
+    """
     samples = params.get("samples", [])
-    n_ch = len(samples)
+    samples_fractional = params.get("samples_fractional")
+    n_ch = len(samples_fractional) if samples_fractional else len(samples)
     size = tuple(meta.get("size", (n_ch,)))
     max_len = meta.get("max_len", max(samples) if samples else 2000)
     unit = meta.get("unit", 1)
@@ -136,8 +142,12 @@ def _build_delay(node, params, meta, fs, nfft, adb, rg, device):
         alias_decay_db=adb, device=device,
     )
 
-    if samples:
-        delays_sec = _samples_to_seconds(samples, fs)
+    #prefer the fractional values when present and the original
+    #module was fractional. integer-delay modules round-trip via
+    #the integer samples list as before.
+    source = samples_fractional if (not isint and samples_fractional) else samples
+    if source:
+        delays_sec = np.array(source, dtype=np.float64) / fs
         mod.assign_value(torch.as_tensor(delays_sec, dtype=torch.float32))
 
     mod.param.requires_grad_(rg)

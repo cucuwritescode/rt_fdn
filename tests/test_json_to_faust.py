@@ -535,6 +535,42 @@ class TestFractionalDelayCodegen:
         assert "200.25" in code
         assert "300.75" in code
 
+    def test_parallel_delay_isint_false_uses_fractional(self):
+        #when flamo meta says isint=False, emit de.fdelay even when
+        #both samples and samples_fractional are present
+        node = _leaf("d", "parallelDelay",
+                      {"samples": [200, 301],
+                       "samples_fractional": [200.25, 300.75]}, n_ch=2)
+        node["flamo"] = {"isint": False, "max_len": 1000, "unit": 1}
+        config = _wrap_config(node)
+        code = json_to_faust(config)
+        assert "de.fdelay(" in code
+        #the fractional values are what appear in the output
+        assert "200.25" in code
+        assert "300.75" in code
+
+    def test_parallel_delay_isint_true_keeps_integer(self):
+        #even when samples_fractional is present, isint=True keeps @(n)
+        node = _leaf("d", "parallelDelay",
+                      {"samples": [200, 301],
+                       "samples_fractional": [200.25, 300.75]}, n_ch=2)
+        node["flamo"] = {"isint": True, "max_len": 1000, "unit": 1}
+        config = _wrap_config(node)
+        code = json_to_faust(config)
+        assert "de.fdelay(" not in code
+        assert "@(200)" in code
+        assert "@(301)" in code
+
+    def test_parallel_delay_default_isint_true(self):
+        #absent isint metadata, default is integer (back-compat)
+        node = _leaf("d", "parallelDelay",
+                      {"samples": [200, 301],
+                       "samples_fractional": [200.25, 300.75]}, n_ch=2)
+        config = _wrap_config(node)
+        code = json_to_faust(config)
+        assert "de.fdelay(" not in code
+        assert "@(200)" in code
+
     def test_variable_delay(self):
         node = _leaf("d", "variableDelay",
                       {"samples": [1000, 2000]}, n_ch=2)

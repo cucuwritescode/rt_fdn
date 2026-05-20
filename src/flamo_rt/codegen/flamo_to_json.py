@@ -196,10 +196,23 @@ def _get_fs_from_delay(module: Any) -> float | None:
 def _quantise_delays(delays_sec: np.ndarray, fs: float) -> list[int]:
     """convert delay lengths from seconds to integer samples.
 
-    rounds to nearest integer. fractional delay error is accepted
-    (see FLAMO_RT_SPEC.md section 11, known limitation 1).
+    rounds to nearest integer. used for the integer-delay code path
+    (faust @(n)). the fractional values are preserved separately
+    so that no-loss reconstruction is possible via json_to_flamo
+    and so that the fractional code path (de.fdelay) can use them.
     """
     samples = np.round(delays_sec * fs).astype(int)
+    return samples.ravel().tolist()
+
+
+def _fractional_delays(delays_sec: np.ndarray, fs: float) -> list[float]:
+    """convert delay lengths from seconds to fractional samples.
+
+    no rounding is applied. emitted alongside the integer samples
+    so that downstream consumers can choose between integer delays
+    (@(n)) and fractional delays (de.fdelay) without loss.
+    """
+    samples = (delays_sec * fs).astype(np.float64)
     return samples.ravel().tolist()
 
 
@@ -293,6 +306,7 @@ def _serialise_leaf(module: Any, name: str, fs: float) -> dict[str, Any]:
     if module_type == "parallelDelay":
         node["params"] = {
             "samples": _quantise_delays(param, fs),
+            "samples_fractional": _fractional_delays(param, fs),
         }
 
     elif module_type in ("Gain", "Matrix", "HouseholderMatrix"):

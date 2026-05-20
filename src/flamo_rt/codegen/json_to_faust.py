@@ -571,8 +571,17 @@ class _FaustEmitter:
 
         #delay modules
         if module_type == "parallelDelay":
-            #check if fractional delays are present
-            if "samples_fractional" in params:
+            #honour the flamo isint flag: if the user constructed
+            #parallelDelay with isint=False they want fractional
+            #delay (de.fdelay), otherwise an integer delay line
+            #(@(n)) is more efficient and bit-exact. as a fallback
+            #for hand-written configs, if only the fractional values
+            #are present, treat that as a fractional request too.
+            flamo_meta = node.get("flamo", {})
+            isint = flamo_meta.get("isint", True)
+            has_int = "samples" in params
+            has_frac = "samples_fractional" in params
+            if (not isint or not has_int) and has_frac:
                 return _emit_fractional_delay(node, self._in_recursion)
             return _emit_parallel_delay(node, self._in_recursion)
 
