@@ -95,8 +95,11 @@ def _build_leaf(
     if module_type == "HouseholderMatrix":
         return _build_householder(node, params, meta, m_nfft, m_adb, m_rg, device)
 
-    if module_type in ("Gain", "Matrix"):
+    if module_type == "Gain":
         return _build_gain(node, params, meta, m_nfft, m_adb, m_rg, device)
+
+    if module_type == "Matrix":
+        return _build_matrix(node, params, meta, m_nfft, m_adb, m_rg, device)
 
     if module_type == "parallelGain":
         return _build_parallel_gain(node, params, meta, m_nfft, m_adb, m_rg, device)
@@ -155,40 +158,48 @@ def _build_delay(node, params, meta, fs, nfft, adb, rg, device):
 
 
 def _build_gain(node, params, meta, nfft, adb, rg, device):
-    """construct a Gain or Matrix module (matrix or diagonal).
+    """construct a Gain module from its raw 2d parameter."""
+    values = np.array(params["gain"], dtype=np.float64)
+    size = tuple(meta.get("size", values.shape))
 
-    if the flamo metadata contains matrix_type, reconstruct a Matrix
-    with the correct type so the map function matches the original.
-    otherwise fall back to a plain Gain.
+    mod = dsp.Gain(
+        size=size, nfft=nfft,
+        alias_decay_db=adb, device=device,
+    )
+    mod.assign_value(torch.as_tensor(values, dtype=torch.float32))
+    mod.param.requires_grad_(rg)
+    return mod
+
+
+def _build_matrix(node, params, meta, nfft, adb, rg, device):
+    """construct a Matrix module from its raw parameter.
+
+    Matrix applies a type-dependent map() during forward. by
+    reconstructing with the original matrix_type and assigning the
+    raw param, flamo's matrix_gallery() reapplies the same map
+    (identity for "random", matrix_exp(skew_matrix(x)) for
+    "orthogonal"), reproducing the original effective matrix exactly.
+    the param is stored under "matrix" (random) or "skew" (orthogonal).
     """
-    if "matrix" in params:
-        values = np.array(params["matrix"], dtype=np.float64)
-        n_out, n_in = values.shape
-        size = tuple(meta.get("size", (n_out, n_in)))
-    elif "gains" in params:
-        gains = np.array(params["gains"], dtype=np.float64)
-        #diagonal gain stored as 1d, but Gain expects 2d size
-        n = len(gains)
-        size = tuple(meta.get("size", (n, 1)))
-        values = gains.reshape(size)
-    else:
-        #no params, identity passthrough
-        n_ch = node.get("input_channels", 1)
-        size = tuple(meta.get("size", (n_ch, n_ch)))
-        values = np.eye(*size, dtype=np.float64)
+    matrix_type = meta.get("matrix_type", "random")
+    n_iter = meta.get("iter", 1)
 
-    matrix_type = meta.get("matrix_type")
-    if matrix_type is not None:
-        m_iter = meta.get("iter", 1)
-        mod = dsp.Matrix(
-            size=size, nfft=nfft, matrix_type=matrix_type, iter=m_iter,
-            alias_decay_db=adb, device=device,
-        )
+    #select the stored param by matrix_type. add new types here as
+    #they are supported on the flamo_to_json side.
+    if matrix_type == "orthogonal":
+        raw = params["skew"]
+    elif matrix_type == "random":
+        raw = params["matrix"]
     else:
-        mod = dsp.Gain(
-            size=size, nfft=nfft,
-            alias_decay_db=adb, device=device,
-        )
+        raise ValueError(f"unsupported Matrix matrix_type: {matrix_type!r}")
+
+    values = np.array(raw, dtype=np.float64)
+    size = tuple(meta.get("size", values.shape))
+
+    mod = dsp.Matrix(
+        size=size, nfft=nfft, matrix_type=matrix_type, iter=n_iter,
+        alias_decay_db=adb, device=device,
+    )
     mod.assign_value(torch.as_tensor(values, dtype=torch.float32))
     mod.param.requires_grad_(rg)
     return mod
@@ -218,16 +229,15 @@ def _build_householder(node, params, meta, nfft, adb, rg, device):
 
 
 def _build_parallel_gain(node, params, meta, nfft, adb, rg, device):
-    """construct a parallelGain module."""
-    gains = params.get("gains", [1.0])
-    n_ch = len(gains)
-    size = tuple(meta.get("size", (n_ch,)))
+    """construct a parallelGain module from its raw 1d parameter."""
+    values = np.array(params["gain"], dtype=np.float64)
+    size = tuple(meta.get("size", values.shape))
 
     mod = dsp.parallelGain(
         size=size, nfft=nfft,
         alias_decay_db=adb, device=device,
     )
-    mod.assign_value(torch.as_tensor(gains, dtype=torch.float32))
+    mod.assign_value(torch.as_tensor(values, dtype=torch.float32))
     mod.param.requires_grad_(rg)
     return mod
 

@@ -252,26 +252,6 @@ def _normalise_sos(sos: np.ndarray) -> list:
     return normalised
 
 
-#gain shape classification
-
-def _classify_gain(param: np.ndarray) -> str:
-    """determine whether a gain parameter represents a matrix or diagonal gains.
-
-    returns "matrix" for any 2d param that mixes or routes channels
-    (including row vectors N to 1 and column vectors 1 to N).
-    returns "diagonal" for 1d params and scalar (1,1) gains.
-    """
-    if param.ndim == 1:
-        return "diagonal"
-    if param.ndim == 2:
-        n_out, n_in = param.shape
-        if n_out == 1 and n_in == 1:
-            #scalar gain, no routing needed
-            return "diagonal"
-        return "matrix"
-    return "matrix"
-
-
 #leaf node serialisation
 
 def _serialise_leaf(module: Any, name: str, fs: float) -> dict[str, Any]:
@@ -309,20 +289,32 @@ def _serialise_leaf(module: Any, name: str, fs: float) -> dict[str, Any]:
             "samples_fractional": _fractional_delays(param, fs),
         }
 
-    elif module_type in ("Gain", "Matrix", "HouseholderMatrix"):
-        shape_class = _classify_gain(param)
-        if shape_class == "matrix":
-            node["params"] = {
-                "matrix": param.tolist(),
-            }
-        else:
-            node["params"] = {
-                "gains": param.ravel().tolist(),
-            }
-
-    elif module_type == "parallelGain":
+    elif module_type in ("Gain", "parallelGain"):
+        #store the raw parameter at its original dimensionality.
+        #Gain is 2D (n_out, n_in); parallelGain is 1D (n_ch).
         node["params"] = {
-            "gains": param.ravel().tolist(),
+            "gain": param.tolist(),
+        }
+
+    elif module_type == "Matrix":
+        #Matrix applies a map() during forward that depends on
+        #matrix_type. for "random" the map is identity, so the raw
+        #param is the literal matrix. for "orthogonal" the map is
+        #matrix_exp(skew_matrix(x)), so the raw param is the skew
+        #generator, not the orthogonal matrix itself; store it under
+        #"skew" to flag that the map must be reapplied on reconstruction.
+        matrix_type = getattr(module, "matrix_type", "random")
+        key = "skew" if matrix_type == "orthogonal" else "matrix"
+        node["params"] = {
+            key: param.tolist(),
+        }
+
+    elif module_type == "HouseholderMatrix":
+        #raw (N, 1) reflection vector; HouseholderMatrix's map()
+        #normalises it to unit norm on reconstruction. stored under
+        #"matrix" to match what _build_householder expects.
+        node["params"] = {
+            "matrix": param.tolist(),
         }
 
     elif module_type == "parallelSOSFilter":
