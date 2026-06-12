@@ -40,6 +40,111 @@ def _fmt(x: float) -> str:
     return f"{x:.10g}"
 
 
+#macro controls
+#
+#post-hoc performance controls layered onto the trained model at
+#emission time. these are deliberately not the trained parameters:
+#raw fdn weights live in a parametrisation space (skew weights,
+#householder vectors) and are jointly optimised, so exposing them
+#individually is meaningless or unstable. instead a fixed set of
+#named slots with known-safe semantics is supported:
+#
+#  rt60      homogeneous decay control. each delay line inside the
+#            recursion is attenuated by gamma^m_i with gamma derived
+#            from the slider value in seconds (jot's per-line gains),
+#            so every line decays at the same rate regardless of its
+#            length. composes multiplicatively with any trained
+#            absorption filters.
+#  dry_wet   equal-sum crossfade between the input and the processed
+#            signal. neutral at 1 (full wet).
+#  pre_delay delay on the wet path input, in milliseconds. neutral
+#            at 0.
+#
+#absent controls cost nothing: the output is identical to an
+#emission without them.
+
+_CONTROL_SPECS: dict[str, dict[str, Any]] = {
+    "rt60": {"label": "rt60", "unit": "s",
+             "init": 2.0, "min": 0.1, "max": 10.0, "step": 0.01},
+    "dry_wet": {"label": "dry/wet", "unit": None,
+                "init": 1.0, "min": 0.0, "max": 1.0, "step": 0.01},
+    "pre_delay": {"label": "pre-delay", "unit": "ms",
+                  "init": 0.0, "min": 0.0, "max": 250.0, "step": 1.0},
+}
+
+#faust identifiers for the control signals. prefixed so they cannot
+#collide with hoisted matrix function names derived from node names.
+_CONTROL_NAMES = {
+    "rt60": "ctl_rt60",
+    "dry_wet": "ctl_drywet",
+    "pre_delay": "ctl_predelay",
+}
+
+#maximum pre-delay buffer: 65536 samples covers 250 ms up to 192 khz
+_PREDELAY_MAX_SAMPLES = 65536
+
+
+def _normalise_controls(controls: dict[str, Any] | None) -> dict[str, dict]:
+    """validate the requested macro controls and fill in defaults.
+
+    each entry may be True (use defaults), a dict overriding any of
+    init/min/max/step/label, or False/None to disable. unknown control
+    names raise ValueError so that typos fail loudly rather than
+    silently emitting a plugin without the expected knob.
+    """
+    if not controls:
+        return {}
+    out: dict[str, dict] = {}
+    for key, spec in controls.items():
+        if key not in _CONTROL_SPECS:
+            raise ValueError(
+                f"unknown macro control '{key}', "
+                f"supported: {sorted(_CONTROL_SPECS)}"
+            )
+        if spec is False or spec is None:
+            continue
+        merged = dict(_CONTROL_SPECS[key])
+        if isinstance(spec, dict):
+            for field in ("init", "min", "max", "step", "label"):
+                if field in spec:
+                    merged[field] = spec[field]
+        out[key] = merged
+    return out
+
+
+def _slider_def(name: str, spec: dict, smooth: bool) -> str:
+    """build a faust hslider definition line for a macro control."""
+    label = spec["label"]
+    if spec.get("unit"):
+        label = f"{label} [unit:{spec['unit']}]"
+    slider = (
+        f'{name} = hslider("{label}", {_fmt(float(spec["init"]))}, '
+        f'{_fmt(float(spec["min"]))}, {_fmt(float(spec["max"]))}, '
+        f'{_fmt(float(spec["step"]))})'
+    )
+    if smooth:
+        return slider + " : si.smoo;"
+    return slider + ";"
+
+
+def _rt60_gain(nominal_samples: float, rt60_name: str) -> str:
+    """per-line attenuation for homogeneous decay (jot's gains).
+
+    a line whose loop time is m samples must attenuate by
+    10^(-3m / (fs * rt60)) per pass so that the level falls 60 db
+    in rt60 seconds regardless of m. expressed via db2linear so the
+    slider stays calibrated in seconds at any sample rate.
+
+    the nominal (uncompensated) delay is used: the loop time through
+    the ~ operator is the full m samples, the emitted delay line is
+    merely one sample shorter.
+    """
+    return (
+        f"*(ba.db2linear(-60.0*{_fmt(nominal_samples)}"
+        f"/(ma.SR*{rt60_name})))"
+    )
+
+
 #matrix row arithmetic
 
 def _build_matrix_row(row: list[float], n_in: int) -> str:
@@ -82,7 +187,11 @@ def _build_matrix_row(row: list[float], n_in: int) -> str:
 #each function takes a node dict and returns a faust expression string.
 #the expression operates on N parallel signal channels.
 
-def _emit_parallel_delay(node: dict[str, Any], in_recursion: bool = False) -> str:
+def _emit_parallel_delay(
+    node: dict[str, Any],
+    in_recursion: bool = False,
+    rt60_name: str | None = None,
+) -> str:
     """parallel delay lines: one @(samples) per channel.
 
     faust @(n) delays a signal by n samples.
@@ -92,6 +201,9 @@ def _emit_parallel_delay(node: dict[str, Any], in_recursion: bool = False) -> st
     to compensate for the implicit one-sample delay introduced by
     the ~ operator. this ensures the total delay matches the original
     flamo specification. we clamp to zero to avoid negative delays.
+
+    when rt60_name is given, each line is followed by its homogeneous
+    decay attenuation derived from the nominal delay length.
     """
     samples = node["params"]["samples"]
     n = len(samples)
@@ -102,13 +214,24 @@ def _emit_parallel_delay(node: dict[str, Any], in_recursion: bool = False) -> st
     else:
         effective = list(samples)
 
+    if rt60_name is not None:
+        channels = [
+            f"@({e}){_rt60_gain(m, rt60_name)}"
+            for e, m in zip(effective, samples)
+        ]
+    else:
+        channels = [f"@({e})" for e in effective]
+
     if n == 1:
-        return f"@({effective[0]})"
-    channels = [f"@({s})" for s in effective]
+        return channels[0]
     return "(" + " , ".join(channels) + ")"
 
 
-def _emit_variable_delay(node: dict[str, Any], in_recursion: bool = False) -> str:
+def _emit_variable_delay(
+    node: dict[str, Any],
+    in_recursion: bool = False,
+    rt60_name: str | None = None,
+) -> str:
     """variable delay using de.delay for runtime-variable delay times.
 
     this is used when delays may change at runtime or when fractional
@@ -133,13 +256,24 @@ def _emit_variable_delay(node: dict[str, Any], in_recursion: bool = False) -> st
     else:
         effective = list(samples)
 
+    if rt60_name is not None:
+        channels = [
+            f"de.delay({buffer_size}, {e}){_rt60_gain(m, rt60_name)}"
+            for e, m in zip(effective, samples)
+        ]
+    else:
+        channels = [f"de.delay({buffer_size}, {e})" for e in effective]
+
     if n == 1:
-        return f"de.delay({buffer_size}, {effective[0]})"
-    channels = [f"de.delay({buffer_size}, {s})" for s in effective]
+        return channels[0]
     return "(" + " , ".join(channels) + ")"
 
 
-def _emit_fractional_delay(node: dict[str, Any], in_recursion: bool = False) -> str:
+def _emit_fractional_delay(
+    node: dict[str, Any],
+    in_recursion: bool = False,
+    rt60_name: str | None = None,
+) -> str:
     """fractional delay using de.fdelay with linear interpolation.
 
     used when delay times are not integer samples. faust's fdelay
@@ -162,9 +296,16 @@ def _emit_fractional_delay(node: dict[str, Any], in_recursion: bool = False) -> 
     else:
         effective = list(samples)
 
+    if rt60_name is not None:
+        channels = [
+            f"de.fdelay({buffer_size}, {_fmt(e)}){_rt60_gain(m, rt60_name)}"
+            for e, m in zip(effective, samples)
+        ]
+    else:
+        channels = [f"de.fdelay({buffer_size}, {_fmt(e)})" for e in effective]
+
     if n == 1:
-        return f"de.fdelay({buffer_size}, {_fmt(effective[0])})"
-    channels = [f"de.fdelay({buffer_size}, {_fmt(s)})" for s in effective]
+        return channels[0]
     return "(" + " , ".join(channels) + ")"
 
 
@@ -414,14 +555,62 @@ def _get_channel_count(node: dict[str, Any] | None) -> int | None:
         return len(params["gains"])
     if "samples" in params:
         return len(params["samples"])
+    if "sos" in params:
+        return len(params["sos"][0])
     #for container nodes, check children or fF/fB
     children = node.get("children", [])
+    if node.get("type") == "Parallel" and children:
+        #branch outputs sum elementwise (width of one branch) when
+        #sum_output is set, otherwise they concatenate
+        if node.get("sum_output"):
+            return _get_channel_count(children[0])
+        counts = [_get_channel_count(c) for c in children]
+        if any(c is None for c in counts):
+            return None
+        return sum(counts)
     if children:
         #last child's output is the container's output
         return _get_channel_count(children[-1])
     ff = node.get("fF")
     if ff is not None:
         return _get_channel_count(ff)
+    return None
+
+
+def _get_input_count(node: dict[str, Any] | None) -> int | None:
+    """infer the input channel count of a json config node.
+
+    mirrors _get_channel_count for the input side. needed to wrap the
+    emitted process expression with macro controls (pre-delay on each
+    input, dry/wet crossfade) without changing its arity.
+    """
+    if node is None:
+        return None
+    in_ch = node.get("input_channels")
+    if in_ch is not None:
+        return int(in_ch)
+    params = node.get("params", {})
+    if "matrix" in params:
+        return len(params["matrix"][0])
+    if "gains" in params:
+        return len(params["gains"])
+    if "samples" in params:
+        return len(params["samples"])
+    if "sos" in params:
+        return len(params["sos"][0])
+    node_type = node.get("type")
+    children = node.get("children", [])
+    if node_type == "Parallel" and children:
+        #both branches share the same input (y-split), so the
+        #parallel's input width is one branch's input width
+        return _get_input_count(children[0])
+    if children:
+        #series and shell take their input from the first child
+        return _get_input_count(children[0])
+    fb = node.get("fB")
+    if fb is not None:
+        #recursion with adders: one external input per feedback channel
+        return _get_channel_count(fb)
     return None
 
 
@@ -436,13 +625,21 @@ class _FaustEmitter:
 
     the in_recursion flag tracks whether we are inside a recursion
     node, which affects delay offset calculation.
+
+    controls is the normalised macro-control dict. the rt60 control
+    attaches per-line attenuations to delays inside recursions, and
+    rt60_used records whether any delay actually consumed it, so the
+    caller can omit the slider when it would be dead code.
     """
 
-    def __init__(self):
+    def __init__(self, controls: dict[str, dict] | None = None):
         #top-level function definitions collected during traversal
         self.definitions: list[str] = []
         #track recursion depth for delay offset
         self._in_recursion: bool = False
+        #normalised macro controls, see _normalise_controls
+        self._controls: dict[str, dict] = controls or {}
+        self.rt60_used: bool = False
 
     def emit(self, node: dict[str, Any]) -> str:
         """dispatch to the appropriate handler based on node type."""
@@ -489,11 +686,24 @@ class _FaustEmitter:
         return "(" + " : ".join(parts) + ")"
 
     def _emit_parallel(self, node: dict[str, Any]) -> str:
-        """parallel composition: a , b or a , b :> _ (if summing).
+        """parallel composition: bus(n) <: (a , b), merged if summing.
 
-        side-by-side composition where inputs and outputs are
-        concatenated. if sum_output is true, we add :> _ to
-        sum all outputs to a single channel.
+        flamo's Parallel feeds the SAME input to every branch (a
+        y-split), then concatenates the branch outputs, or sums them
+        elementwise when sum_output is true. faust's bare , operator
+        instead concatenates INPUTS, so it alone would demand separate
+        inputs per branch and wire the model wrongly. the correct
+        emission splits the shared input across the branches:
+
+            si.bus(n_in) <: (a , b)
+
+        and for sum_output merges pairwise back to the branch width:
+
+            ... :> si.bus(n_out)
+
+        when the shared input width cannot be inferred from the config
+        the split is omitted with a warning comment, falling back to
+        input concatenation.
         """
         children = node.get("children", [])
         if not children:
@@ -502,10 +712,32 @@ class _FaustEmitter:
         if len(parts) == 1:
             return parts[0]
         parallel_expr = " , ".join(parts)
+
+        #shared input width: flamo asserts both branches agree
+        n_in = _get_input_count(children[0])
+        if n_in is None or n_in <= 0:
+            self.definitions.append(
+                f"//warning: input channel count of parallel node "
+                f"'{node.get('name', '?')}' unknown, emitting input "
+                f"concatenation instead of a shared-input split"
+            )
+            split = ""
+        elif n_in == 1:
+            split = "_ <: "
+        else:
+            split = f"si.bus({n_in}) <: "
+
         sum_output = node.get("sum_output", False)
-        if sum_output:
-            return f"({parallel_expr} :> _)"
-        return f"({parallel_expr})"
+        if not sum_output:
+            return f"({split}({parallel_expr}))"
+
+        #elementwise sum of branch outputs, width of one branch
+        n_out = _get_channel_count(children[0])
+        if n_out is None or n_out <= 1:
+            merge = "_"
+        else:
+            merge = f"si.bus({n_out})"
+        return f"({split}({parallel_expr}) :> {merge})"
 
     def _emit_recursion(self, node: dict[str, Any]) -> str:
         """recursion (feedback): (interleave : adders : fF) ~ fB
@@ -555,8 +787,23 @@ class _FaustEmitter:
                 #interleave feedback and external signals so each adder
                 #receives one of each: [fb0,ext0, fb1,ext1, ...]
                 adders = f"ro.interleave({n_fb}, 2) : par(i, {n_fb}, +)"
-            return f"(({adders} : {ff_expr}) ~ {fb_expr})"
+            #the delays inside the loop were shortened by one sample to
+            #keep the loop period exact despite the ~ operator. that
+            #alone advances every output arrival by one sample, which
+            #matters as soon as the recursion is mixed with an
+            #uncompensated path (a direct gain in a parallel branch).
+            #re-delaying the recursion OUTPUT by one sample sits outside
+            #the loop, so the loop period is untouched and absolute
+            #arrival times match flamo sample-exactly.
+            if n_fb == 1:
+                comp = "@(1)"
+            else:
+                comp = f"par(i, {n_fb}, @(1))"
+            return f"((({adders} : {ff_expr}) ~ {fb_expr}) : {comp})"
 
+        #without a feedback channel count we cannot size the adders or
+        #the output compensation; emit the bare recursion (delays inside
+        #were still shortened, so arrivals run one sample early here)
         return f"({ff_expr} ~ {fb_expr})"
 
     def _emit_leaf(self, node: dict[str, Any]) -> str:
@@ -569,7 +816,19 @@ class _FaustEmitter:
         module_type = node.get("module_type", "")
         params = node.get("params", {})
 
+        #rt60 attenuation applies to delay lines inside the feedback
+        #loop only: those define the loop time the decay is tied to.
+        #delays outside a recursion (pre-delays, offsets) are left alone.
+        rt60_name = None
+        if "rt60" in self._controls and self._in_recursion:
+            rt60_name = _CONTROL_NAMES["rt60"]
+
         #delay modules
+        if module_type in ("parallelDelay", "Delay", "variableDelay",
+                           "fractionalDelay"):
+            if rt60_name is not None:
+                self.rt60_used = True
+
         if module_type == "parallelDelay":
             #honour the flamo isint flag: if the user constructed
             #parallelDelay with isint=False they want fractional
@@ -582,18 +841,18 @@ class _FaustEmitter:
             has_int = "samples" in params
             has_frac = "samples_fractional" in params
             if (not isint or not has_int) and has_frac:
-                return _emit_fractional_delay(node, self._in_recursion)
-            return _emit_parallel_delay(node, self._in_recursion)
+                return _emit_fractional_delay(node, self._in_recursion, rt60_name)
+            return _emit_parallel_delay(node, self._in_recursion, rt60_name)
 
         if module_type == "Delay":
             #single-channel delay, treat as parallel with one channel
-            return _emit_parallel_delay(node, self._in_recursion)
+            return _emit_parallel_delay(node, self._in_recursion, rt60_name)
 
         if module_type == "variableDelay":
-            return _emit_variable_delay(node, self._in_recursion)
+            return _emit_variable_delay(node, self._in_recursion, rt60_name)
 
         if module_type == "fractionalDelay":
-            return _emit_fractional_delay(node, self._in_recursion)
+            return _emit_fractional_delay(node, self._in_recursion, rt60_name)
 
         #gain modules
         if module_type in ("Gain", "Matrix", "HouseholderMatrix"):
@@ -736,7 +995,10 @@ def _describe_topology(config: dict[str, Any], fs: int) -> list[str]:
 
 #public api
 
-def json_to_faust(config: dict[str, Any]) -> str:
+def json_to_faust(
+    config: dict[str, Any],
+    controls: dict[str, Any] | None = None,
+) -> str:
     """generate a complete faust .dsp source file from a json config dict.
 
     the config dict is the output of flamo_to_json(). the returned string
@@ -747,6 +1009,13 @@ def json_to_faust(config: dict[str, Any]) -> str:
     ----------
     config : dict
         json config dict as produced by flamo_to_json().
+    controls : dict, optional
+        macro controls to expose as sliders in the generated dsp.
+        keys are "rt60", "dry_wet", "pre_delay"; values are True for
+        defaults or a dict overriding init/min/max/step/label.
+        entries given here override any "controls" key embedded in
+        the config. with no controls the output is identical to
+        previous versions.
 
     returns
     -------
@@ -756,8 +1025,76 @@ def json_to_faust(config: dict[str, Any]) -> str:
     name = config.get("name", "untitled")
     fs = config.get("fs", 48000)
 
-    emitter = _FaustEmitter()
+    #controls may live in the config (so the json ir carries them) or
+    #be passed at call time; call-time entries win per control
+    requested = dict(config.get("controls") or {})
+    if controls:
+        requested.update(controls)
+    ctl = _normalise_controls(requested)
+
+    emitter = _FaustEmitter(ctl)
     process_expr = emitter.emit(config)
+
+    #wire the macro controls around the emitted expression
+    ctl_defs: list[str] = []
+    ctl_warnings: list[str] = []
+
+    if "rt60" in ctl:
+        if emitter.rt60_used:
+            ctl_defs.append(
+                _slider_def(_CONTROL_NAMES["rt60"], ctl["rt60"], smooth=True)
+            )
+        else:
+            ctl_warnings.append(
+                "//warning: rt60 control requested but the model has no "
+                "delay lines inside a recursion, control omitted"
+            )
+
+    n_in = _get_input_count(config)
+    n_out = _get_channel_count(config)
+
+    if "pre_delay" in ctl:
+        if n_in is not None and n_in > 0:
+            pd_name = _CONTROL_NAMES["pre_delay"]
+            stage = (
+                f"de.delay({_PREDELAY_MAX_SAMPLES}, "
+                f"int({pd_name}*0.001*ma.SR))"
+            )
+            if n_in > 1:
+                stage = f"par(i, {n_in}, {stage})"
+            process_expr = f"({stage} : {process_expr})"
+            ctl_defs.append(
+                _slider_def(pd_name, ctl["pre_delay"], smooth=False)
+            )
+        else:
+            ctl_warnings.append(
+                "//warning: pre_delay control requested but the input "
+                "channel count could not be inferred, control omitted"
+            )
+
+    if "dry_wet" in ctl:
+        if n_in is not None and n_in > 0 and n_in == n_out:
+            dw_name = _CONTROL_NAMES["dry_wet"]
+            if n_in == 1:
+                wet = f"*({dw_name})"
+                dry = f"*(1.0 - {dw_name})"
+                bus = "_"
+            else:
+                wet = f"par(i, {n_in}, *({dw_name}))"
+                dry = f"par(i, {n_in}, *(1.0 - {dw_name}))"
+                bus = f"si.bus({n_in})"
+            process_expr = (
+                f"({bus} <: ({process_expr} : {wet}), {dry} :> {bus})"
+            )
+            ctl_defs.append(
+                _slider_def(dw_name, ctl["dry_wet"], smooth=True)
+            )
+        else:
+            ctl_warnings.append(
+                "//warning: dry_wet control requires matching input and "
+                f"output channel counts (got {n_in} in, {n_out} out), "
+                "control omitted"
+            )
 
     #assemble the complete dsp file
     lines = []
@@ -778,6 +1115,15 @@ def json_to_faust(config: dict[str, Any]) -> str:
     if topo:
         for line in topo:
             lines.append(f"//{line}")
+        lines.append("")
+
+    #macro control sliders and any control warnings
+    if ctl_defs or ctl_warnings:
+        lines.append("//macro controls")
+        for warning in ctl_warnings:
+            lines.append(warning)
+        for defn in ctl_defs:
+            lines.append(defn)
         lines.append("")
 
     #hoisted definitions (matrices, warnings)

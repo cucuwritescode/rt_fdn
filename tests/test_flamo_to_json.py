@@ -15,7 +15,7 @@ from typing import Any
 import numpy as np
 import pytest
 
-from flamo_rt.codegen.flamo_to_json import (
+from rt_fdn.codegen.flamo_to_json import (
     flamo_to_json,
     _classify_gain,
     _detect_module_type,
@@ -78,6 +78,23 @@ class parallelGain:
 class Matrix(Gain):
     """mock flamo Matrix module."""
     pass
+
+
+class HouseholderMatrix:
+    """mock flamo HouseholderMatrix module.
+
+    stores the raw vector u as a column parameter and exposes the map
+    that normalises it to unit length, mirroring the real module. the
+    effective matrix I - 2uu^T is never stored, only computed in forward.
+    """
+
+    def __init__(self, u: np.ndarray):
+        u = np.asarray(u, dtype=np.float64).reshape(-1, 1)
+        self.param = _MockParam(u)
+        n = u.shape[0]
+        self.input_channels = n
+        self.output_channels = n
+        self.map = lambda p: p.numpy() / np.linalg.norm(p.numpy())
 
 
 class parallelSOSFilter:
@@ -200,7 +217,7 @@ class TestFractionalDelays:
 
     def test_emitted_alongside_integer_samples(self):
         #flamo_to_json should include both fields for parallelDelay
-        from flamo_rt.codegen.flamo_to_json import _serialise_leaf
+        from rt_fdn.codegen.flamo_to_json import _serialise_leaf
 
         delay = parallelDelay(np.array([0.023, 0.030]), fs=48000.0)
         node = _serialise_leaf(delay, "d", fs=48000.0)
@@ -274,6 +291,96 @@ class TestClassifyGain:
 
     def test_rectangular_matrix(self):
         assert _classify_gain(np.ones((3, 4))) == "matrix"
+
+
+#effective parameter (map-aware) serialisation tests
+
+class TestEffectiveParam:
+    """flamo applies map(param) in forward, not param itself.
+
+    codegen must serialise the effective (post-map) values, otherwise
+    matrix types with non-identity maps (orthogonal, hadamard, rotation,
+    householder) bake the raw training weights into the faust output.
+    the raw parameter must travel under flamo metadata for round-trips.
+    """
+
+    def test_identity_gain_has_no_param_raw(self):
+        from rt_fdn.codegen.flamo_to_json import _serialise_leaf
+
+        values = 0.5 * np.eye(3)
+        node = _serialise_leaf(Gain(values), "g", fs=48000.0)
+        np.testing.assert_allclose(node["params"]["matrix"], values)
+        assert "param_raw" not in node.get("flamo", {})
+
+    def test_explicit_identity_map_has_no_param_raw(self):
+        from rt_fdn.codegen.flamo_to_json import _serialise_leaf
+
+        values = 0.5 * np.eye(3)
+        g = Gain(values)
+        g.map = lambda p: p.numpy()
+        node = _serialise_leaf(g, "g", fs=48000.0)
+        np.testing.assert_allclose(node["params"]["matrix"], values)
+        assert "param_raw" not in node.get("flamo", {})
+
+    def test_orthogonal_map_serialises_effective_matrix(self):
+        from rt_fdn.codegen.flamo_to_json import _serialise_leaf
+
+        #mimics matrix_type="orthogonal": raw skew-symmetric weights,
+        #effective matrix is their exponential. for a 2x2 skew matrix
+        #with off-diagonal theta the exponential is a rotation by theta.
+        theta = 0.3
+        raw = np.array([[0.0, theta], [-theta, 0.0]])
+        expected = np.array([
+            [np.cos(theta), np.sin(theta)],
+            [-np.sin(theta), np.cos(theta)],
+        ])
+
+        m = Matrix(raw)
+        m.map = lambda p: np.array([
+            [np.cos(p.numpy()[0, 1]), np.sin(p.numpy()[0, 1])],
+            [-np.sin(p.numpy()[0, 1]), np.cos(p.numpy()[0, 1])],
+        ])
+        node = _serialise_leaf(m, "feedback", fs=48000.0)
+
+        #the serialised matrix is the effective rotation, not the skew weights
+        np.testing.assert_allclose(node["params"]["matrix"], expected, atol=1e-12)
+        matrix = np.array(node["params"]["matrix"])
+        np.testing.assert_allclose(matrix @ matrix.T, np.eye(2), atol=1e-12)
+        #the raw weights survive under flamo metadata for round-tripping
+        np.testing.assert_allclose(node["flamo"]["param_raw"], raw)
+
+    def test_householder_serialises_full_effective_matrix(self):
+        from rt_fdn.codegen.flamo_to_json import _serialise_leaf
+
+        #u = [1,1,1,1] normalises to [0.5]*4, so I - 2uu^T has 0.5 on
+        #the diagonal and -0.5 everywhere else
+        u = np.array([1.0, 1.0, 1.0, 1.0])
+        node = _serialise_leaf(HouseholderMatrix(u), "fb", fs=48000.0)
+
+        matrix = np.array(node["params"]["matrix"])
+        assert matrix.shape == (4, 4)
+        expected = np.eye(4) - 0.5 * np.ones((4, 4))
+        np.testing.assert_allclose(matrix, expected, atol=1e-12)
+        #householder matrices are orthogonal and involutory
+        np.testing.assert_allclose(matrix @ matrix.T, np.eye(4), atol=1e-12)
+        #raw u column preserved for reconstruction
+        np.testing.assert_allclose(
+            node["flamo"]["param_raw"], u.reshape(-1, 1)
+        )
+
+    def test_failing_map_falls_back_to_raw(self):
+        from rt_fdn.codegen.flamo_to_json import _serialise_leaf
+
+        values = 0.5 * np.eye(2)
+        m = Matrix(values)
+
+        def boom(p):
+            raise RuntimeError("map needs torch")
+
+        m.map = boom
+        node = _serialise_leaf(m, "g", fs=48000.0)
+        np.testing.assert_allclose(node["params"]["matrix"], values)
+        assert "param_raw" not in node.get("flamo", {})
 
 
 #module type detection tests

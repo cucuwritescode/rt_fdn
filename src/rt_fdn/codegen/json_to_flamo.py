@@ -184,7 +184,17 @@ def _build_gain(node, params, meta, nfft, adb, rg, device):
             size=size, nfft=nfft, matrix_type=matrix_type, iter=m_iter,
             alias_decay_db=adb, device=device,
         )
+        #the matrix gallery re-applies the map on every forward, so the
+        #raw pre-map weights must be restored, not the effective matrix.
+        #legacy configs without param_raw stored the raw weights under
+        #params["matrix"], which the fallback above already picked up.
+        raw = meta.get("param_raw")
+        if raw is not None:
+            values = np.array(raw, dtype=np.float64)
     else:
+        #plain Gain applies the identity map, so assigning the effective
+        #values preserves the behaviour even when the original module
+        #carried a custom (non-serialisable) map function
         mod = dsp.Gain(
             size=size, nfft=nfft,
             alias_decay_db=adb, device=device,
@@ -197,13 +207,37 @@ def _build_gain(node, params, meta, nfft, adb, rg, device):
 def _build_householder(node, params, meta, nfft, adb, rg, device):
     """construct a HouseholderMatrix module.
 
-    the json stores the unit vector as a column matrix (N, 1).
-    HouseholderMatrix internally sets size=(N, 1) and reconstructs
-    U = I - 2*u*u^T from the normalised vector.
+    flamo stores only the vector u and reconstructs U = I - 2*u*u^T on
+    every forward, so the module must be given u, not U. prefer the raw
+    pre-map vector from the flamo metadata. for configs that carry only
+    the effective N x N matrix, recover u from (I - U)/2, which is the
+    rank-one outer product uu^T: any nonzero column is proportional to u.
+    legacy configs that stored u directly under params["matrix"] as a
+    column vector are still accepted.
     """
-    if "matrix" in params:
-        values = np.array(params["matrix"], dtype=np.float64)
+    raw = meta.get("param_raw")
+    if raw is not None:
+        values = np.array(raw, dtype=np.float64).reshape(-1, 1)
         N = values.shape[0]
+    elif "matrix" in params:
+        m = np.array(params["matrix"], dtype=np.float64)
+        if m.ndim == 2 and m.shape[1] == 1:
+            #legacy config: the raw u vector stored under matrix
+            values = m
+            N = m.shape[0]
+        else:
+            #effective matrix: factorise (I - U)/2 = uu^T, taking the
+            #largest column for numerical robustness. the sign of u is
+            #irrelevant since uu^T is sign-invariant.
+            N = m.shape[0]
+            outer = (np.eye(N) - m) / 2.0
+            j = int(np.argmax(np.linalg.norm(outer, axis=0)))
+            pivot = outer[j, j]
+            if pivot <= 0.0:
+                #degenerate input (not a householder matrix), fall back
+                values = np.ones((N, 1), dtype=np.float64) / np.sqrt(N)
+            else:
+                values = (outer[:, j] / np.sqrt(pivot)).reshape(N, 1)
     else:
         N = node.get("input_channels", 1)
         values = np.ones((N, 1), dtype=np.float64) / np.sqrt(N)

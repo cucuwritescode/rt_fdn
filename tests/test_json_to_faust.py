@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import pytest
 
-from flamo_rt.codegen.json_to_faust import json_to_faust
+from rt_fdn.codegen.json_to_faust import json_to_faust
 
 
 #helpers
@@ -161,6 +161,200 @@ class TestMatrixGainCodegen:
         code = json_to_faust(config)
         assert "mix(x0, x1)" in code
 
+    def test_householder_emits_full_matrix_function(self):
+        #flamo_to_json serialises the effective I - 2uu^T for
+        #HouseholderMatrix, so the emitter must produce an N-input
+        #mixing function, never a column vector
+        matrix = [
+            [0.5, -0.5, -0.5, -0.5],
+            [-0.5, 0.5, -0.5, -0.5],
+            [-0.5, -0.5, 0.5, -0.5],
+            [-0.5, -0.5, -0.5, 0.5],
+        ]
+        node = _leaf("fb", "HouseholderMatrix", {"matrix": matrix})
+        config = _wrap_config(node, name="fb")
+        code = json_to_faust(config)
+        assert "fb(x0, x1, x2, x3) =" in code
+
+
+#macro control tests
+
+def _recursion_config(controls: dict | None = None) -> dict:
+    """2-channel fdn loop: parallel delays fed back through a matrix."""
+    node = {
+        "type": "Recursion",
+        "name": "loop",
+        "fF": _leaf("delays", "parallelDelay", {"samples": [100, 200]}, n_ch=2),
+        "fB": _leaf("fb", "Gain", {"matrix": [[0.0, 0.7], [-0.7, 0.0]]}, n_ch=2),
+    }
+    config = _wrap_config(node, name="macro_test")
+    if controls is not None:
+        config["controls"] = controls
+    return config
+
+
+class TestMacroControls:
+    def test_no_controls_output_unchanged(self):
+        code = json_to_faust(_recursion_config())
+        assert "ctl_" not in code
+        assert "//macro controls" not in code
+
+    def test_rt60_emits_per_line_jot_gains(self):
+        code = json_to_faust(_recursion_config({"rt60": True}))
+        #slider calibrated in seconds, smoothed
+        assert 'ctl_rt60 = hslider("rt60 [unit:s]", 2, 0.1, 10, 0.01) : si.smoo;' in code
+        #attenuation uses the nominal delay (100), the line itself the
+        #compensated delay (99), so decay rate is homogeneous per line
+        assert "@(99)*(ba.db2linear(-60.0*100/(ma.SR*ctl_rt60)))" in code
+        assert "@(199)*(ba.db2linear(-60.0*200/(ma.SR*ctl_rt60)))" in code
+
+    def test_rt60_without_recursion_is_omitted(self):
+        #a bare delay outside any feedback loop has no loop time, the
+        #control must be dropped with a warning, not silently attached
+        node = _leaf("d", "parallelDelay", {"samples": [100]}, n_ch=1)
+        config = _wrap_config(node)
+        config["controls"] = {"rt60": True}
+        code = json_to_faust(config)
+        assert "warning: rt60" in code
+        assert "hslider" not in code
+        assert "ba.db2linear" not in code
+
+    def test_dry_wet_wraps_process(self):
+        code = json_to_faust(_recursion_config({"dry_wet": True}))
+        assert 'ctl_drywet = hslider("dry/wet", 1, 0, 1, 0.01) : si.smoo;' in code
+        #equal-sum crossfade: wet scaled by the slider, dry by its complement
+        assert "si.bus(2) <:" in code
+        assert "par(i, 2, *(ctl_drywet))" in code
+        assert "par(i, 2, *(1.0 - ctl_drywet))" in code
+        assert ":> si.bus(2)" in code
+
+    def test_dry_wet_channel_mismatch_warns(self):
+        #4 inputs mixed to 1 output: no dry path mapping exists
+        node = _leaf("out", "Gain", {"matrix": [[0.25, 0.25, 0.25, 0.25]]})
+        node["input_channels"] = 4
+        node["output_channels"] = 1
+        config = _wrap_config(node)
+        config["controls"] = {"dry_wet": True}
+        code = json_to_faust(config)
+        assert "warning: dry_wet" in code
+        assert "ctl_drywet =" not in code
+
+    def test_pre_delay_on_each_input(self):
+        code = json_to_faust(_recursion_config({"pre_delay": True}))
+        assert 'ctl_predelay = hslider("pre-delay [unit:ms]", 0, 0, 250, 1);' in code
+        assert "par(i, 2, de.delay(65536, int(ctl_predelay*0.001*ma.SR)))" in code
+
+    def test_combined_controls_pre_delay_inside_wet_path(self):
+        code = json_to_faust(
+            _recursion_config({"rt60": True, "dry_wet": True, "pre_delay": True})
+        )
+        #all three sliders present
+        assert "ctl_rt60 =" in code
+        assert "ctl_drywet =" in code
+        assert "ctl_predelay =" in code
+        #pre-delay wraps the core first, so it sits inside the wet
+        #branch of the dry/wet split: the dry signal is not pre-delayed
+        wet_start = code.index("<:")
+        predelay_pos = code.index("de.delay(65536")
+        dry_pos = code.index("par(i, 2, *(1.0 - ctl_drywet))")
+        assert wet_start < predelay_pos < dry_pos
+
+    def test_custom_ranges(self):
+        code = json_to_faust(
+            _recursion_config({"rt60": {"init": 3.5, "max": 20.0}})
+        )
+        assert 'hslider("rt60 [unit:s]", 3.5, 0.1, 20, 0.01)' in code
+
+    def test_call_time_controls_override_config(self):
+        config = _recursion_config({"rt60": {"init": 2.0}})
+        code = json_to_faust(config, controls={"rt60": {"init": 5.0}})
+        assert 'hslider("rt60 [unit:s]", 5, 0.1, 10, 0.01)' in code
+
+    def test_unknown_control_raises(self):
+        with pytest.raises(ValueError, match="unknown macro control"):
+            json_to_faust(_recursion_config({"reverb_amount": True}))
+
+    def test_disabled_control_is_skipped(self):
+        code = json_to_faust(_recursion_config({"rt60": False}))
+        assert "ctl_rt60" not in code
+
+
+#multichannel io tests
+
+def _stereo_fdn_config(controls: dict | None = None) -> dict:
+    """stereo-in stereo-out fdn: B (4x2) -> 4-line loop -> C (2x4)."""
+    config = {
+        "type": "Series",
+        "name": "stereo",
+        "children": [
+            _leaf("b_in", "Gain",
+                  {"matrix": [[1.0, 0.0], [0.0, 1.0], [1.0, 0.0], [0.0, 1.0]]}),
+            {
+                "type": "Recursion",
+                "name": "loop",
+                "fF": _leaf("delays", "parallelDelay",
+                            {"samples": [100, 200, 300, 400]}, n_ch=4),
+                "fB": _leaf("fb", "Gain", {"matrix": [
+                    [0.5, 0.5, 0.5, 0.5],
+                    [0.5, -0.5, 0.5, -0.5],
+                    [0.5, 0.5, -0.5, -0.5],
+                    [0.5, -0.5, -0.5, 0.5],
+                ]}),
+            },
+            _leaf("c_out", "Gain",
+                  {"matrix": [[0.25, 0.25, 0.0, 0.0], [0.0, 0.0, 0.25, 0.25]]}),
+        ],
+    }
+    config["children"][0]["input_channels"] = 2
+    config["children"][0]["output_channels"] = 4
+    config["children"][2]["input_channels"] = 4
+    config["children"][2]["output_channels"] = 2
+    config = _wrap_config(config, name="stereo")
+    if controls is not None:
+        config["controls"] = controls
+    return config
+
+
+class TestMultichannelIO:
+    """B in R^{N x k_in} and C in R^{k_out x N} must emit through the
+    generic matrix path with the correct arities: multichannel io is
+    a property of the matrices, not special-cased plumbing."""
+
+    def test_stereo_input_matrix_has_two_args(self):
+        code = json_to_faust(_stereo_fdn_config())
+        #B is 4x2: function of two inputs producing four rows
+        assert "b_in(x0, x1) =" in code
+
+    def test_stereo_output_matrix_mixes_four_lines(self):
+        code = json_to_faust(_stereo_fdn_config())
+        #C is 2x4: function of four inputs producing two rows
+        assert "c_out(x0, x1, x2, x3) =" in code
+
+    def test_loop_adders_follow_feedback_not_io(self):
+        #the recursion interleaves 4 feedback channels regardless of
+        #the external io width
+        code = json_to_faust(_stereo_fdn_config())
+        assert "ro.interleave(4, 2) : par(i, 4, +)" in code
+
+    def test_dry_wet_uses_stereo_bus(self):
+        code = json_to_faust(_stereo_fdn_config({"dry_wet": True}))
+        assert "si.bus(2) <:" in code
+        assert "par(i, 2, *(ctl_drywet))" in code
+
+    def test_pre_delay_on_both_inputs(self):
+        code = json_to_faust(_stereo_fdn_config({"pre_delay": True}))
+        assert "par(i, 2, de.delay(65536, int(ctl_predelay*0.001*ma.SR)))" in code
+
+    def test_asymmetric_io_emits_correct_arities(self):
+        #mono in, stereo out: dry/wet must refuse, matrices still correct
+        config = _stereo_fdn_config({"dry_wet": True})
+        config["children"][0]["params"]["matrix"] = [[1.0], [1.0], [1.0], [1.0]]
+        config["children"][0]["input_channels"] = 1
+        code = json_to_faust(config)
+        assert "b_in(x0) =" in code
+        assert "c_out(x0, x1, x2, x3) =" in code
+        assert "warning: dry_wet" in code
+
 
 #sos filter tests
 
@@ -215,6 +409,7 @@ class TestComposition:
         assert "*(0.5)" in code
 
     def test_parallel_no_sum(self):
+        #flamo Parallel is a y-split: both branches see the same input
         g1 = _leaf("a", "parallelGain", {"gains": [0.5]}, n_ch=1)
         g2 = _leaf("b", "parallelGain", {"gains": [0.3]}, n_ch=1)
         par = {
@@ -225,9 +420,8 @@ class TestComposition:
         }
         config = _wrap_config(par)
         code = json_to_faust(config)
-        assert "*(0.5)" in code
-        assert "*(0.3)" in code
-        #parallel without sum should not have :>
+        assert "_ <: (*(0.5) , *(0.3))" in code
+        #outputs concatenate, no merge
         assert ":>" not in code
 
     def test_parallel_with_sum(self):
@@ -241,7 +435,55 @@ class TestComposition:
         }
         config = _wrap_config(par)
         code = json_to_faust(config)
+        #shared input split, branch outputs summed: y = a(x) + b(x)
+        assert "_ <: (*(0.5) , *(0.3)) :> _" in code
+
+    def test_recursion_output_compensation(self):
+        #delays inside the loop are shortened by one for the ~ sample;
+        #a one-sample delay on the recursion output restores absolute
+        #arrival times so wet and direct paths stay aligned
+        code = json_to_faust(_recursion_config())
+        assert "(@(99) , @(199))" in code  #loop delays shortened
+        assert ": par(i, 2, @(1)))" in code  #output re-delayed outside loop
+
+    def test_parallel_direct_path_structure(self):
+        #the standard dss fdn: Parallel(fdn_branch, D) with summing.
+        #both the wet branch and the direct gain see the one input
+        fdn_branch = {
+            "type": "Series",
+            "name": "wet",
+            "children": [
+                _leaf("b_in", "Gain", {"matrix": [[1.0], [1.0]]}, n_ch=2),
+                _leaf("c_out", "Gain", {"matrix": [[0.5, 0.5]]}, n_ch=2),
+            ],
+        }
+        fdn_branch["children"][0]["input_channels"] = 1
+        fdn_branch["children"][1]["output_channels"] = 1
+        direct = _leaf("D", "Gain", {"matrix": [[0.2]]}, n_ch=1)
+        par = {
+            "type": "Parallel",
+            "name": "core",
+            "children": [fdn_branch, direct],
+            "sum_output": True,
+        }
+        code = json_to_faust(_wrap_config(par))
+        #one shared input split across wet and direct, summed to one out
+        assert "_ <: " in code
         assert ":> _" in code
+
+    def test_parallel_multichannel_sum_keeps_width(self):
+        #two 2-channel branches summed: output stays 2 wide, not 1
+        g1 = _leaf("a", "parallelGain", {"gains": [0.5, 0.4]}, n_ch=2)
+        g2 = _leaf("b", "parallelGain", {"gains": [0.3, 0.2]}, n_ch=2)
+        par = {
+            "type": "Parallel",
+            "name": "merge2",
+            "children": [g1, g2],
+            "sum_output": True,
+        }
+        code = json_to_faust(_wrap_config(par))
+        assert "si.bus(2) <: " in code
+        assert ":> si.bus(2)" in code
 
     def test_recursion(self):
         delay = _leaf("d", "parallelDelay", {"samples": [1000]}, n_ch=1)

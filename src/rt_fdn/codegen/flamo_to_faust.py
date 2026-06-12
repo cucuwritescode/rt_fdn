@@ -11,8 +11,8 @@ from __future__ import annotations
 
 from typing import Any
 
-from flamo_rt.codegen.flamo_to_json import flamo_to_json
-from flamo_rt.codegen.json_to_faust import json_to_faust
+from rt_fdn.codegen.flamo_to_json import flamo_to_json
+from rt_fdn.codegen.json_to_faust import json_to_faust
 
 
 def flamo_to_faust(
@@ -20,6 +20,7 @@ def flamo_to_faust(
     fs: float,
     *,
     name: str = "FDN",
+    controls: dict[str, Any] | None = None,
 ) -> str:
     """convert a flamo model directly to faust dsp source code.
 
@@ -35,6 +36,11 @@ def flamo_to_faust(
         to integer samples.
     name : str
         name for the dsp, appears in the generated faust header comment.
+    controls : dict, optional
+        macro controls to expose as sliders ("rt60", "dry_wet",
+        "pre_delay"), see json_to_faust(). these are post-hoc
+        performance controls layered onto the trained model, not the
+        trained parameters themselves.
 
     returns
     -------
@@ -42,4 +48,4 @@ def flamo_to_faust(
         complete faust dsp source code ready for compilation or interpretation.
     """
     config = flamo_to_json(model, fs, name=name)
-    return json_to_faust(config)
+    return json_to_faust(config, controls=controls)

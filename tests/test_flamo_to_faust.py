@@ -17,9 +17,9 @@ from typing import Any
 import numpy as np
 import pytest
 
-from flamo_rt.codegen.flamo_to_faust import flamo_to_faust
-from flamo_rt.codegen.flamo_to_json import flamo_to_json
-from flamo_rt.codegen.json_to_faust import json_to_faust
+from rt_fdn.codegen.flamo_to_faust import flamo_to_faust
+from rt_fdn.codegen.flamo_to_json import flamo_to_json
+from rt_fdn.codegen.json_to_faust import json_to_faust
 
 
 #mock flamo modules (same as test_flamo_to_json.py)

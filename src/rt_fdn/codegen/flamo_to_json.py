@@ -191,6 +191,65 @@ def _get_fs_from_delay(module: Any) -> float | None:
     return getattr(module, "fs", None)
 
 
+def _tensor_like_to_numpy(val: Any) -> np.ndarray:
+    """convert a torch tensor, mock parameter, or array-like to float64 numpy.
+
+    handles complex outputs (flamo maps cast to complex for frequency-domain
+    multiplication) by discarding the imaginary part, which is zero by
+    construction for frequency-independent gains.
+    """
+    if hasattr(val, "detach") and callable(val.detach):
+        val = val.detach()
+    if hasattr(val, "cpu") and callable(val.cpu):
+        val = val.cpu()
+    if hasattr(val, "numpy") and callable(val.numpy):
+        val = val.numpy()
+    arr = np.asarray(val)
+    if np.iscomplexobj(arr):
+        arr = arr.real
+    return arr.astype(np.float64)
+
+
+def _effective_param(module: Any, module_type: str, raw: np.ndarray) -> np.ndarray:
+    """compute the effective parameter the module applies in its forward pass.
+
+    flamo modules store a raw parameter and apply a map function to it on
+    every forward call: the value actually multiplied into the signal is
+    map(param), not param. Matrix(matrix_type="orthogonal") stores
+    skew-symmetric weights and computes their matrix exponential, and
+    HouseholderMatrix stores a vector u and applies I - 2uu^T. serialising
+    the raw parameter would bake the wrong values into the generated faust
+    code, so codegen consumes the mapped value and the raw parameter
+    travels separately under the flamo metadata for round-tripping.
+
+    falls back to the raw parameter when the module carries no map
+    attribute (identity behaviour) or the map cannot be evaluated.
+    """
+    map_fn = getattr(module, "map", None)
+    if callable(map_fn):
+        try:
+            mapped = _tensor_like_to_numpy(map_fn(module.param))
+        except Exception:
+            #map not evaluable outside the training environment, use raw
+            mapped = raw
+    else:
+        mapped = raw
+
+    if module_type == "HouseholderMatrix":
+        #the map yields the unitary vector u; the effective matrix
+        #applied to the signal is I - 2uu^T. normalise defensively:
+        #a unit vector passes through unchanged, a raw fallback gets
+        #the normalisation the flamo map would have applied.
+        u = mapped.reshape(-1, 1)
+        norm = float(np.linalg.norm(u))
+        if norm > 0.0:
+            u = u / norm
+        n = u.shape[0]
+        return np.eye(n) - 2.0 * (u @ u.T)
+
+    return mapped
+
+
 #delay quantisation
 
 def _quantise_delays(delays_sec: np.ndarray, fs: float) -> list[int]:
@@ -310,20 +369,28 @@ def _serialise_leaf(module: Any, name: str, fs: float) -> dict[str, Any]:
         }
 
     elif module_type in ("Gain", "Matrix", "HouseholderMatrix"):
-        shape_class = _classify_gain(param)
+        effective = _effective_param(module, module_type, param)
+        shape_class = _classify_gain(effective)
         if shape_class == "matrix":
             node["params"] = {
-                "matrix": param.tolist(),
+                "matrix": effective.tolist(),
             }
         else:
             node["params"] = {
-                "gains": param.ravel().tolist(),
+                "gains": effective.ravel().tolist(),
             }
+        #keep the raw pre-map parameter whenever the map is not the
+        #identity, so json_to_flamo can restore the trainable weights
+        if effective.shape != param.shape or not np.array_equal(effective, param):
+            node.setdefault("flamo", {})["param_raw"] = param.tolist()
 
     elif module_type == "parallelGain":
+        effective = _effective_param(module, module_type, param)
         node["params"] = {
-            "gains": param.ravel().tolist(),
+            "gains": effective.ravel().tolist(),
         }
+        if not np.array_equal(effective, param):
+            node.setdefault("flamo", {})["param_raw"] = param.tolist()
 
     elif module_type == "parallelSOSFilter":
         #sos shape: (n_sections, 6, n_channels)
