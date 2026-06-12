@@ -367,6 +367,12 @@ def _build_shell(node, fs, nfft, adb, device):
     the shell wraps a time-domain core with frequency-domain io
     layers. nfft is read from the flamo metadata if available,
     otherwise the function-level default is used.
+
+    flamo's Shell asserts that the core, input_layer, and output_layer
+    all share the same nfft. if a child node carries its own nfft in
+    metadata, the reconstructed core may end up with a different nfft
+    than shell_nfft, breaking the assertion. align the io layers with
+    the core's actual nfft to avoid this.
     """
     meta = node.get("flamo", {})
     shell_nfft = meta.get("nfft", nfft)
@@ -379,10 +385,12 @@ def _build_shell(node, fs, nfft, adb, device):
         core = dsp.Gain(size=(1, 1), nfft=shell_nfft, device=device)
         core.assign_value(torch.ones(1, 1, dtype=torch.float32))
 
+    core_nfft = getattr(core, "nfft", shell_nfft)
+
     return system.Shell(
         core=core,
-        input_layer=dsp.FFT(shell_nfft),
-        output_layer=dsp.iFFT(shell_nfft),
+        input_layer=dsp.FFT(core_nfft),
+        output_layer=dsp.iFFT(core_nfft),
     )
 
 

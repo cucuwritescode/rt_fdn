@@ -122,16 +122,38 @@ class Recursion:
         self.output_channels = getattr(fF, "output_channels", None)
 
 
-class Shell:
-    """mock flamo Shell module (wraps core with fft/ifft io layers)."""
+class _MockIOLayer:
+    """mock fft/ifft io layer carrying nfft, as flamo's FFT/iFFT do."""
 
-    def __init__(self, core: Any):
+    def __init__(self, nfft: int):
+        self.nfft = nfft
+
+
+class Shell:
+    """mock flamo Shell module (wraps core with fft/ifft io layers).
+
+    flamo's Shell stores its io layers under double-underscore names,
+    which python mangles to _Shell__input_layer / _Shell__output_layer.
+    the public accessors are get_inputLayer() / get_outputLayer(), and
+    nfft is exposed directly on Shell. this mock mimics that layout.
+    """
+
+    def __init__(self, core: Any, nfft: int = 2**11):
         self._Shell__core = core
+        self._Shell__input_layer = _MockIOLayer(nfft)
+        self._Shell__output_layer = _MockIOLayer(nfft)
+        self.nfft = nfft
         self.input_channels = getattr(core, "input_channels", None)
         self.output_channels = getattr(core, "output_channels", None)
 
     def get_core(self):
         return self._Shell__core
+
+    def get_inputLayer(self):
+        return self._Shell__input_layer
+
+    def get_outputLayer(self):
+        return self._Shell__output_layer
 
 
 #delay quantisation tests
@@ -333,6 +355,21 @@ class TestFlamoToJson:
         assert config["type"] == "Shell"
         assert config["name"] == "TestFDN"
         assert config["fs"] == 48000
+
+    def test_shell_captures_nfft(self, mock_fdn_model):
+        """Shell's nfft must be captured for round-tripping.
+
+        flamo Shell stores its io layers under name-mangled attributes
+        (_Shell__input_layer), so a naive getattr(model, "input_layer")
+        returns None. nfft must instead be read from the public
+        Shell.nfft attribute or via get_inputLayer().
+        """
+        model, fs = mock_fdn_model
+        config = flamo_to_json(model, fs)
+
+        assert "flamo" in config, "shell node should carry flamo metadata"
+        assert "nfft" in config["flamo"], "shell metadata should include nfft"
+        assert config["flamo"]["nfft"] == model.nfft
 
     def test_json_serialisable(self, mock_fdn_model):
         """the entire config must be json-serialisable."""

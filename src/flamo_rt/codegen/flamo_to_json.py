@@ -396,13 +396,17 @@ def _traverse(model: Any, name: str, fs: float) -> dict[str, Any]:
         else:
             node["children"] = []
 
-        #capture nfft from the io layers for round-tripping
+        #capture nfft for round-tripping. flamo Shell name-mangles its
+        #io layers (no public input_layer attr) but exposes nfft directly;
+        #fall back to the public get_inputLayer() accessor if needed.
         flamo_meta: dict[str, Any] = {}
-        input_layer = getattr(model, "input_layer", None)
-        if input_layer is not None:
-            nfft = getattr(input_layer, "nfft", None)
-            if nfft is not None:
-                flamo_meta["nfft"] = int(nfft)
+        nfft = getattr(model, "nfft", None)
+        if nfft is None:
+            get_in = getattr(model, "get_inputLayer", None)
+            if callable(get_in):
+                nfft = getattr(get_in(), "nfft", None)
+        if nfft is not None:
+            flamo_meta["nfft"] = int(nfft)
         if flamo_meta:
             node["flamo"] = flamo_meta
 
