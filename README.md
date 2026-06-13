@@ -122,10 +122,10 @@ the criterion is small-gain: the product of per-element spectral norms around ea
 
 ## equivalence
 
-generated FAUST matches FLAMO sample-exactly, direct paths included. the energy decay of the compiled plugin follows the FLAMO reference throughout, and the underlying impulse responses agree to within single-precision arithmetic noise. all four stereo paths match identically; the suite pins them.
+generated FAUST matches FLAMO sample-exactly, direct paths included. top: the two impulse responses overlaid (they coincide). bottom: their difference, about 100 dB below the response, which is float32 arithmetic noise rather than model mismatch. all four stereo paths match identically; the suite pins them.
 
 <p align="center">
-<img src="plots/edc_match.png" width="70%">
+<img src="plots/ir_match.png" width="80%">
 </p>
 
 the rt60 macro-control on the compiled plugin, measured by Schroeder integration, follows the ideal decay for the slider value:
