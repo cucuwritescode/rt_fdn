@@ -3,13 +3,13 @@
 """
 generate the equivalence and rt60-validation figures in plots/.
 
-two figures:
-  ir_match.png        flamo vs compiled faust on one representative
-                      path: overlay on top (exact match = traces
-                      coincide), difference below in db re peak (the
-                      gap is the story: ~100 db = float32 noise)
-  rt60_validation.png schroeder energy decay of the compiled plugin
-                      with the rt60 knob at 0.5 s, against the ideal
+two figures, styled for the paper (serif, no internal titles)
+  edc_match.png       schroeder energy decay of flamo vs the compiled
+                      faust, overlaid. the curves coincide, which is
+                      the whole message. sample-level agreement is
+                      stated numerically in the text, not plotted
+  rt60_validation.png energy decay of the compiled plugin with the
+                      rt60 knob at 0.5 s, against the ideal
                       -120 db/s line and the lossless reference
 
 requires faust2plot on PATH and an environment with flamo, torch,
@@ -31,6 +31,16 @@ from pathlib import Path
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+
+#paper styling, matches a times-set document
+plt.rcParams.update({
+    "font.family": "serif",
+    "font.serif": ["Times New Roman", "Times", "Nimbus Roman", "DejaVu Serif"],
+    "mathtext.fontset": "stix",
+    "font.size": 11,
+    "legend.fontsize": 9.5,
+    "axes.linewidth": 0.8,
+})
 import numpy as np
 import torch
 from flamo.processor import dsp, system
@@ -113,42 +123,25 @@ def main() -> None:
     #no alignment needed, see module docstring
     fa = run_faust(code, "(impulse, 0.0)", "in0", workdir, NFFT)
 
-    #figure 1: one representative path (input 1 to output 1), overlay
-    #on top, difference below. the other three stereo paths match
-    #identically and are pinned by the test suite; one readable panel
-    #beats four cluttered ones.
+    #figure 1, energy decay overlay. one concept, two curves that
+    #coincide. readable at first sight by anyone who reads edcs.
     a, b = fl[0, 0], fa[0]
-    peak = np.max(np.abs(a))
-    t_ms = np.arange(NFFT) / FS * 1000.0
-    sl = slice(0, int(0.15 * FS))
+    n_cmp = 24000
+    tt = np.arange(n_cmp) / FS
 
-    fig, (ax1, ax2) = plt.subplots(
-        2, 1, figsize=(9, 6), sharex=True,
-        gridspec_kw={"height_ratios": [1.2, 1.0]},
-    )
-    ax1.plot(t_ms[sl], a[sl], lw=1.0, color="#1f77b4",
-             label="FLAMO (frequency domain)")
-    ax1.plot(t_ms[sl], b[sl], lw=1.0, ls="--", color="#ff7f0e",
-             label="generated FAUST (compiled)")
-    ax1.set_ylabel("amplitude")
-    ax1.set_title("impulse response: the traces coincide", fontsize=11)
-    ax1.legend(fontsize=9, loc="upper right")
-    ax1.grid(alpha=0.3)
-
-    ax2.plot(t_ms[sl], 20 * np.log10(np.maximum(np.abs(a[sl]) / peak, 1e-12)),
-             lw=0.7, color="#1f77b4", alpha=0.7, label="response level")
-    ax2.plot(t_ms[sl], 20 * np.log10(np.maximum(np.abs(a[sl] - b[sl]) / peak, 1e-12)),
-             lw=0.7, color="#d62728", label="difference FLAMO vs FAUST")
-    ax2.axhline(-80, color="grey", ls=":", lw=1)
-    ax2.text(2, -75, "-80 dB", fontsize=8, color="grey")
-    ax2.set_ylim(-140, 5)
-    ax2.set_ylabel("dB re peak")
-    ax2.set_xlabel("time (ms)")
-    ax2.set_title("the difference sits about 100 dB below the response",
-                  fontsize=11)
-    ax2.grid(alpha=0.3)
+    fig, ax = plt.subplots(figsize=(5.4, 3.2))
+    ax.plot(tt, edc_db(a[:n_cmp]), lw=1.4, color="black",
+            label="FLAMO (frequency domain)")
+    ax.plot(tt, edc_db(b[:n_cmp]), lw=1.4, ls=(0, (4, 3)), color="#c1272d",
+            label="generated FAUST (compiled)")
+    ax.set_xlim(0, 0.5)
+    ax.set_ylim(-80, 2)
+    ax.set_xlabel("time (s)")
+    ax.set_ylabel("energy decay (dB)")
+    ax.grid(alpha=0.25, lw=0.5)
+    ax.legend(frameon=False)
     fig.tight_layout()
-    fig.savefig(OUTDIR / "ir_match.png", dpi=150)
+    fig.savefig(OUTDIR / "edc_match.png", dpi=300)
     plt.close(fig)
 
     #figure 3: rt60 validation, lossless prototype for both variants
@@ -160,22 +153,21 @@ def main() -> None:
                       "lossless", workdir, FS)[0]
 
     tt = np.arange(FS) / FS
-    fig, ax = plt.subplots(figsize=(9, 5))
-    ax.plot(tt, edc_db(ir_ll), lw=1.2, color="#1f77b4",
-            label="lossless prototype: reference, no decay expected")
-    ax.plot(tt, edc_db(ir_rt), lw=1.2, color="#d62728",
-            label="rt60 control at 0.5 s: should follow the dashed line")
-    ax.plot(tt, -120.0 * tt, ls="--", lw=1, color="black",
-            label="ideal -120 dB/s (RT60 = 0.5 s)")
+    fig, ax = plt.subplots(figsize=(5.4, 3.2))
+    ax.plot(tt, edc_db(ir_rt), lw=1.4, color="black",
+            label="control at 0.5 s")
+    ax.plot(tt, -120.0 * tt, lw=1.2, ls=(0, (4, 3)), color="#c1272d",
+            label="ideal, RT60 of 0.5 s")
+    ax.plot(tt, edc_db(ir_ll), lw=1.2, color="0.65",
+            label="lossless prototype")
     ax.set_xlim(0, 0.8)
-    ax.set_ylim(-120, 3)
+    ax.set_ylim(-100, 2)
     ax.set_xlabel("time (s)")
     ax.set_ylabel("energy decay (dB)")
-    ax.set_title("rt60 macro-control: Schroeder decay on compiled FAUST")
-    ax.grid(alpha=0.3)
-    ax.legend(fontsize=9)
+    ax.grid(alpha=0.25, lw=0.5)
+    ax.legend(frameon=False)
     fig.tight_layout()
-    fig.savefig(OUTDIR / "rt60_validation.png", dpi=150)
+    fig.savefig(OUTDIR / "rt60_validation.png", dpi=300)
     plt.close(fig)
 
     for f in sorted(OUTDIR.glob("*.png")):
