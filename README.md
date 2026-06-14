@@ -2,14 +2,14 @@
 
 # ADAC
 
-**automatic differentiable audio compilation**
+**Automatic Differentiable Audio Compilation**
 
 [![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue.svg)](https://www.python.org/downloads/)
 [![License: MIT](https://img.shields.io/badge/licence-MIT-green.svg)](LICENSE)
-[![Tests](https://img.shields.io/badge/tests-195%20passing-brightgreen.svg)](#testing)
+[![Tests](https://img.shields.io/badge/tests-200%20passing-brightgreen.svg)](#testing)
 ![Status](https://img.shields.io/badge/status-beta-yellow.svg)
 
-*bridge the gap between differentiable audio research and deployable real-time plugins*
+*from differentiable audio research to efficient real-time DSP*
 
 </div>
 
